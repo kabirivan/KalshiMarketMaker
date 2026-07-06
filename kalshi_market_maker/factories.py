@@ -40,4 +40,12 @@ def create_market_maker(mm_config: Dict, api, logger, risk_config: Dict | None =
         max_contracts_per_market=risk_config.get("max_contracts_per_market"),
         reserve_contracts_buffer=risk_config.get("reserve_contracts_buffer", 0),
         shared_risk_state=shared_risk_state,
+        fee_rate=mm_config.get("fee_rate", 0.07),
+        fee_safety_buffer=mm_config.get("fee_safety_buffer", 0.01),
+        sigma_window_ticks=mm_config.get("sigma_window_ticks", 30),
+        sigma_min=mm_config.get("sigma_min", 0.005),
+        sigma_scale=mm_config.get("sigma_scale", 1.0),
+        k_min=mm_config.get("k_min", 10.0),
+        k_max=mm_config.get("k_max", 500.0),
+        k_depth_reference=mm_config.get("k_depth_reference", 200.0),
     )

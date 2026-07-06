@@ -110,6 +110,21 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as request_exception:
+                # Only retry on network/timeout errors or retryable HTTP status codes.
+                # 4xx (400/401/403/404/409/410) means a client-side problem — retrying is pointless
+                # and produces log noise / duplicate order risk.
+                is_http_error = isinstance(request_exception, requests.exceptions.HTTPError)
+                status_code = (
+                    request_exception.response.status_code
+                    if is_http_error and request_exception.response is not None
+                    else None
+                )
+                if is_http_error and status_code not in retryable_codes:
+                    self.logger.error(f"Non-retryable HTTP error {status_code} for {method} {path}: {request_exception}")
+                    if request_exception.response is not None:
+                        self.logger.error(f"Response content: {request_exception.response.text}")
+                    raise
+
                 if attempt < max_retries:
                     backoff = 0.5 * (2**attempt) + random.uniform(0, 0.25)
                     self.logger.warning(
@@ -132,24 +147,48 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
         total_position = 0
         for position in positions:
-            if position["ticker"] == self.market_ticker:
-                total_position += position["position"]
+            if position.get("ticker") == self.market_ticker:
+                # Kalshi V2 renamed `position` (int) -> `position_fp` (decimal string).
+                raw = position.get("position_fp", position.get("position", 0)) or 0
+                total_position += int(float(raw))
 
         return total_position
 
     def get_price(self) -> Dict[str, float]:
         path = f"/markets/{self.market_ticker}"
         data = self.make_request("GET", path)
+        market = data["market"]
 
-        yes_bid = float(data["market"]["yes_bid"]) / 100
-        yes_ask = float(data["market"]["yes_ask"]) / 100
-        no_bid = float(data["market"]["no_bid"]) / 100
-        no_ask = float(data["market"]["no_ask"]) / 100
+        def read_side(dollars_key: str, cents_key: str) -> float:
+            dollars = market.get(dollars_key)
+            if dollars is not None:
+                return float(dollars)
+            return float(market.get(cents_key, 0)) / 100
+
+        def read_size(fp_key: str) -> float:
+            value = market.get(fp_key)
+            try:
+                return float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        yes_bid = read_side("yes_bid_dollars", "yes_bid")
+        yes_ask = read_side("yes_ask_dollars", "yes_ask")
+        no_bid = read_side("no_bid_dollars", "no_bid")
+        no_ask = read_side("no_ask_dollars", "no_ask")
 
         yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
         no_mid_price = round((no_bid + no_ask) / 2, 2)
 
-        return {"yes": yes_mid_price, "no": no_mid_price}
+        return {
+            "yes": yes_mid_price,
+            "no": no_mid_price,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "yes_bid_size": read_size("yes_bid_size_fp"),
+            "yes_ask_size": read_size("yes_ask_size_fp"),
+            "close_time": market.get("close_time"),
+        }
 
     def place_order(self, action: str, side: str, price: float, quantity: int, expiration_ts: int = None) -> str:
         return self.place_order_for_ticker(
@@ -170,27 +209,36 @@ class KalshiTradingAPI(AbstractTradingAPI):
         quantity: int,
         expiration_ts: int = None,
     ) -> str:
-        path = "/portfolio/orders"
+        # Kalshi V2: POST /portfolio/events/orders, side=bid|ask, price in dollar-decimal strings.
+        if side != "yes":
+            raise ValueError(
+                f"place_order_for_ticker under Kalshi V2 API currently only supports side='yes'; got side={side!r}"
+            )
+        action_lower = action.lower()
+        if action_lower == "buy":
+            v2_side = "bid"
+        elif action_lower == "sell":
+            v2_side = "ask"
+        else:
+            raise ValueError(f"Unsupported action {action!r}; expected 'buy' or 'sell'")
+
+        path = "/portfolio/events/orders"
+        # Round to nearest cent — Kalshi rejects prices outside the market's price_step (0.01).
+        price_cents = max(1, min(99, int(round(price * 100))))
         data = {
             "ticker": ticker,
-            "action": action.lower(),
-            "type": "limit",
-            "side": side,
-            "count": quantity,
+            "side": v2_side,
+            "count": str(int(quantity)),
+            "price": f"{price_cents / 100:.4f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "maker",
             "client_order_id": str(uuid.uuid4()),
         }
-
-        price_to_send = int(price * 100)
-        if side == "yes":
-            data["yes_price"] = price_to_send
-        else:
-            data["no_price"] = price_to_send
-
         if expiration_ts is not None:
-            data["expiration_ts"] = expiration_ts
+            data["expiration_time"] = int(expiration_ts)
 
         response = self.make_request("POST", path, data=data)
-        return str(response["order"]["order_id"])
+        return str(response["order_id"])
 
     def get_market(self, ticker: str) -> Dict:
         path = f"/markets/{ticker}"
@@ -217,6 +265,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
             response = self.make_request("GET", path, params=params)
             batch = response.get("market_positions", [])
+            # Kalshi V2 uses `position_fp` (decimal string); inject legacy `position` (int)
+            # so downstream code that reads it still works.
+            for entry in batch:
+                if "position" not in entry:
+                    raw = entry.get("position_fp", 0) or 0
+                    try:
+                        entry["position"] = int(float(raw))
+                    except (TypeError, ValueError):
+                        entry["position"] = 0
             positions.extend(batch)
 
             pages += 1
@@ -228,9 +285,14 @@ class KalshiTradingAPI(AbstractTradingAPI):
         return positions
 
     def cancel_order(self, order_id: int) -> bool:
-        path = f"/portfolio/orders/{order_id}"
+        # Kalshi V2 cancel path; reduced_by is a decimal string.
+        path = f"/portfolio/events/orders/{order_id}"
         response = self.make_request("DELETE", path)
-        return response["reduced_by"] > 0
+        try:
+            reduced = float(response.get("reduced_by", "0"))
+        except (TypeError, ValueError):
+            reduced = 0.0
+        return reduced > 0
 
     def get_orders(self, ticker: Optional[str] = None, status: str = "resting") -> List[Dict]:
         path = "/portfolio/orders"

@@ -1,8 +1,29 @@
 import math
+import statistics
 import time
+from collections import deque
+from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
+import requests
+
 from .interfaces import AbstractTradingAPI
+
+
+def _is_market_closed_error(exception: Exception) -> bool:
+    if not isinstance(exception, requests.exceptions.HTTPError):
+        return False
+    response = getattr(exception, "response", None)
+    if response is None or response.status_code != 409:
+        return False
+    try:
+        payload = response.json()
+    except (ValueError, AttributeError):
+        return False
+    error_obj = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error_obj, dict):
+        return False
+    return error_obj.get("code") == "market_closed"
 
 
 class AvellanedaMarketMaker:
@@ -24,10 +45,21 @@ class AvellanedaMarketMaker:
         max_contracts_per_market: Optional[int] = None,
         reserve_contracts_buffer: int = 0,
         shared_risk_state: Optional[Dict] = None,
+        fee_rate: float = 0.07,
+        fee_safety_buffer: float = 0.01,
+        sigma_window_ticks: int = 30,
+        sigma_min: float = 0.005,
+        sigma_scale: float = 1.0,
+        k_min: float = 10.0,
+        k_max: float = 500.0,
+        k_depth_reference: float = 200.0,
     ):
         self.api = api
         self.logger = logger
         self.base_gamma = gamma
+        # Static config values kept as fallbacks; dynamic estimates override at each tick.
+        self.k_config = k
+        self.sigma_config = sigma
         self.k = k
         self.sigma = sigma
         self.T = T
@@ -41,6 +73,18 @@ class AvellanedaMarketMaker:
         self.max_contracts_per_market = max_contracts_per_market
         self.reserve_contracts_buffer = max(0, int(reserve_contracts_buffer))
         self.shared_risk_state = shared_risk_state or {"active_markets": 1}
+        self.fee_rate = fee_rate
+        self.fee_safety_buffer = fee_safety_buffer
+        # Phase 1: per-market adaptive params.
+        self.sigma_window_ticks = max(5, int(sigma_window_ticks))
+        self.sigma_min = sigma_min
+        self.sigma_scale = sigma_scale
+        self.k_min = k_min
+        self.k_max = k_max
+        self.k_depth_reference = max(1.0, float(k_depth_reference))
+        self.mid_history = deque(maxlen=self.sigma_window_ticks)
+        # None means "use elapsed_time / self.T"; otherwise this fraction is used directly.
+        self._time_remaining_override: Optional[float] = None
 
     def run(self, dt: float, stop_event=None):
         start_time = time.time()
@@ -50,28 +94,89 @@ class AvellanedaMarketMaker:
                 break
 
             current_time = time.time() - start_time
-            mid_prices = self.api.get_price()
-            mid_price = mid_prices[self.trade_side]
-            inventory = self.api.get_position()
+            try:
+                mid_prices = self.api.get_price()
+                mid_price = mid_prices[self.trade_side]
+                inventory = self.api.get_position()
 
-            reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
-            bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
-            current_orders = self.api.get_orders()
-            buy_size, sell_size = self.calculate_order_sizes(inventory, current_orders)
+                # Phase 1: adapt σ, k, and time-remaining fraction from live market data.
+                self.mid_history.append(mid_price)
+                self.sigma = self._estimate_sigma()
+                self.k = self._estimate_k(mid_prices)
+                self._time_remaining_override = self._compute_time_remaining_fraction(
+                    mid_prices.get("close_time")
+                )
 
-            self.logger.info(
-                f"t={current_time:.2f}s mid={mid_price:.4f} inventory={inventory} "
-                f"reservation={reservation_price:.4f} bid={bid_price:.4f} ask={ask_price:.4f}"
-            )
+                reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
+                bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
+                current_orders = self.api.get_orders()
+                buy_size, sell_size = self.calculate_order_sizes(inventory, current_orders)
 
-            self.manage_orders(bid_price, ask_price, buy_size, sell_size, current_orders)
+                t_rem_str = (
+                    f" t_rem={self._time_remaining_override:.3f}"
+                    if self._time_remaining_override is not None
+                    else ""
+                )
+                self.logger.info(
+                    f"t={current_time:.2f}s mid={mid_price:.4f} inventory={inventory} "
+                    f"reservation={reservation_price:.4f} bid={bid_price:.4f} ask={ask_price:.4f} "
+                    f"σ={self.sigma:.4f} k={self.k:.1f}{t_rem_str}"
+                )
+
+                self.manage_orders(bid_price, ask_price, buy_size, sell_size, current_orders)
+            except requests.exceptions.HTTPError as http_error:
+                if _is_market_closed_error(http_error):
+                    self.logger.warning(
+                        "Market is closed; exiting worker loop cleanly so the selector can rotate it out"
+                    )
+                    break
+                raise
             time.sleep(dt)
 
         self.logger.info("Avellaneda market maker finished running")
 
+    def _estimate_sigma(self) -> float:
+        # Realized per-tick std of mid moves. Needs at least a few samples;
+        # falls back to configured sigma during warm-up.
+        min_samples = max(5, self.sigma_window_ticks // 3)
+        if len(self.mid_history) < min_samples:
+            return self.sigma_config
+        mids = list(self.mid_history)
+        diffs = [mids[i] - mids[i - 1] for i in range(1, len(mids))]
+        if len(diffs) < 2:
+            return self.sigma_config
+        try:
+            realized = statistics.stdev(diffs)
+        except statistics.StatisticsError:
+            realized = 0.0
+        return max(self.sigma_min, realized * self.sigma_scale)
+
+    def _estimate_k(self, book_snapshot: Dict) -> float:
+        # Higher book depth (contracts resting near mid) implies more competing MMs
+        # and faster order arrival, so k grows. Linearly interpolate to [k_min, k_max].
+        bid_size = book_snapshot.get("yes_bid_size", 0) or 0
+        ask_size = book_snapshot.get("yes_ask_size", 0) or 0
+        depth_avg = (float(bid_size) + float(ask_size)) / 2.0
+        ratio = min(1.0, depth_avg / self.k_depth_reference)
+        return self.k_min + (self.k_max - self.k_min) * ratio
+
+    def _compute_time_remaining_fraction(self, close_time_str) -> Optional[float]:
+        # Fraction of the model horizon T that is still available before market close.
+        # Returns None if we have no close_time to work with (caller then uses elapsed/T).
+        if not close_time_str:
+            return None
+        try:
+            close_dt = datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        seconds_to_close = close_dt.timestamp() - time.time()
+        if seconds_to_close <= 0:
+            return 0.0
+        return max(0.0, min(1.0, seconds_to_close / self.T))
+
     def calculate_asymmetric_quotes(self, mid_price: float, inventory: int, elapsed_time: float) -> Tuple[float, float]:
         reservation_price = self.calculate_reservation_price(mid_price, inventory, elapsed_time)
-        base_spread = self.calculate_optimal_spread(elapsed_time, inventory)
+        base_spread = self.calculate_optimal_spread(elapsed_time, inventory, mid_price)
 
         effective_max_position = self.get_effective_max_position()
         position_ratio = inventory / effective_max_position
@@ -89,15 +194,20 @@ class AvellanedaMarketMaker:
 
         return bid_price, ask_price
 
+    def _resolve_time_remaining(self, elapsed_time: float) -> float:
+        if self._time_remaining_override is not None:
+            return self._time_remaining_override
+        return max(0.0, 1 - elapsed_time / self.T)
+
     def calculate_reservation_price(self, mid_price: float, inventory: int, elapsed_time: float) -> float:
         dynamic_gamma = self.calculate_dynamic_gamma(inventory)
         inventory_skew = -inventory * self.inventory_skew_factor * mid_price
-        time_remaining = max(0.0, 1 - elapsed_time / self.T)
+        time_remaining = self._resolve_time_remaining(elapsed_time)
         return mid_price + inventory_skew - inventory * dynamic_gamma * (self.sigma ** 2) * time_remaining
 
-    def calculate_optimal_spread(self, elapsed_time: float, inventory: int) -> float:
+    def calculate_optimal_spread(self, elapsed_time: float, inventory: int, mid_price: float = 0.5) -> float:
         dynamic_gamma = self.calculate_dynamic_gamma(inventory)
-        time_remaining = max(0.0, 1 - elapsed_time / self.T)
+        time_remaining = self._resolve_time_remaining(elapsed_time)
         base_spread = (
             dynamic_gamma * (self.sigma ** 2) * time_remaining
             + (2 / dynamic_gamma) * math.log(1 + (dynamic_gamma / self.k))
@@ -105,7 +215,12 @@ class AvellanedaMarketMaker:
         effective_max_position = self.get_effective_max_position()
         position_ratio = min(1.0, abs(inventory) / effective_max_position)
         spread_multiplier = 1 + 2.0 * position_ratio
-        return max(base_spread * spread_multiplier, self.min_spread)
+        # Fee-aware floor: Kalshi charges ~ceil(fee_rate * price * (1 - price)) cents per side per contract.
+        # Roundtrip fee = 2 sides; add a safety buffer for slippage / adverse selection.
+        fee_per_side = math.ceil(self.fee_rate * mid_price * (1 - mid_price) * 100) / 100
+        fee_min_spread = 2 * fee_per_side + self.fee_safety_buffer
+        effective_min = max(self.min_spread, fee_min_spread)
+        return max(base_spread * spread_multiplier, effective_min)
 
     def calculate_dynamic_gamma(self, inventory: int) -> float:
         effective_max_position = self.get_effective_max_position()
@@ -146,7 +261,8 @@ class AvellanedaMarketMaker:
         for order in current_orders:
             if order.get("side") != self.trade_side:
                 continue
-            remaining = int(float(order.get("remaining_count", 0)))
+            raw_remaining = order.get("remaining_count_fp", order.get("remaining_count", 0)) or 0
+            remaining = int(float(raw_remaining))
             if order.get("action") == "buy":
                 pending_buy += remaining
             elif order.get("action") == "sell":
@@ -209,15 +325,22 @@ class AvellanedaMarketMaker:
         keep_order = None
 
         for order in orders:
-            current_price = (
-                float(order["yes_price"]) / 100
-                if self.trade_side == "yes"
-                else float(order["no_price"]) / 100
-            )
+            if self.trade_side == "yes":
+                price_dollars = order.get("yes_price_dollars")
+                current_price = (
+                    float(price_dollars) if price_dollars is not None else float(order.get("yes_price", 0)) / 100
+                )
+            else:
+                price_dollars = order.get("no_price_dollars")
+                current_price = (
+                    float(price_dollars) if price_dollars is not None else float(order.get("no_price", 0)) / 100
+                )
+            raw_remaining = order.get("remaining_count_fp", order.get("remaining_count", 0)) or 0
+            remaining = int(float(raw_remaining))
             if (
                 keep_order is None
                 and abs(current_price - desired_price) < 0.01
-                and order["remaining_count"] == desired_size
+                and remaining == desired_size
             ):
                 keep_order = order
             else:

@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 
@@ -8,7 +9,26 @@ def safe_float(value, default=0.0):
         return default
 
 
+def seconds_until_close(market: Dict, now_ts: float) -> float:
+    close_time = market.get("close_time")
+    if not close_time:
+        return float("inf")
+    try:
+        # Kalshi returns ISO-8601 like "2026-07-20T00:00:00Z"
+        close_str = close_time.replace("Z", "+00:00")
+        close_dt = datetime.fromisoformat(close_str)
+    except (ValueError, TypeError, AttributeError):
+        return float("inf")
+    return close_dt.timestamp() - now_ts
+
+
 def compute_spread_cents(market: Dict) -> float:
+    # Kalshi API now returns *_dollars fields; older field names are kept as fallback.
+    bid_dollars = market.get("yes_bid_dollars")
+    ask_dollars = market.get("yes_ask_dollars")
+    if bid_dollars is not None and ask_dollars is not None:
+        return (safe_float(ask_dollars, 0.0) - safe_float(bid_dollars, 0.0)) * 100.0
+
     yes_bid = safe_float(market.get("yes_bid"), -1)
     yes_ask = safe_float(market.get("yes_ask"), -1)
     if yes_bid < 0 or yes_ask < 0:
@@ -54,6 +74,8 @@ def select_top_markets(markets: List[Dict], selector_cfg: Dict) -> List[Tuple[st
     top_n = int(selector_cfg.get("top_n", 8))
     volume_weight = safe_float(selector_cfg.get("volume_weight", 0.5))
     spread_weight = safe_float(selector_cfg.get("spread_weight", 0.5))
+    min_time_to_close_seconds = safe_float(selector_cfg.get("min_time_to_close_seconds", 0))
+    now_ts = datetime.now(timezone.utc).timestamp()
 
     def collect_candidates(ignore_thresholds: bool) -> List[Dict]:
         collected = []
@@ -65,7 +87,16 @@ def select_top_markets(markets: List[Dict], selector_cfg: Dict) -> List[Tuple[st
             if not ticker:
                 continue
 
-            volume_24h = safe_float(market.get("volume_24h", market.get("volume", 0)))
+            # Skip markets that close too soon: no time to unwind, high adverse-selection risk,
+            # and the worker is likely to hit HTTP 409 market_closed within a tick or two.
+            if seconds_until_close(market, now_ts) < min_time_to_close_seconds:
+                continue
+
+            volume_24h = safe_float(
+                market.get("volume_24h_fp")
+                if market.get("volume_24h_fp") is not None
+                else market.get("volume_24h", market.get("volume_fp", market.get("volume", 0)))
+            )
             spread_cents = compute_spread_cents(market)
             if spread_cents < 0:
                 continue

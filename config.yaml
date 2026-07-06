@@ -1,11 +1,11 @@
 dynamic:
   log_level: INFO
   risk:
-    max_global_contracts: 20
-    max_contracts_per_market: 3
-    reserve_contracts_buffer: 2
+    max_global_contracts: 70
+    max_contracts_per_market: 1
+    reserve_contracts_buffer: 1
   market_selector:
-    top_n: 5
+    top_n: 2
     refresh_seconds: 45
     worker_shutdown_timeout_seconds: 15
     min_volume_24h: 500
@@ -16,9 +16,10 @@ dynamic:
     page_limit: 250
     max_pages: 5
     max_markets: 1250
+    min_time_to_close_seconds: 300
     # series_ticker: "FED"
   market_maker:
-    max_position: 3
+    max_position: 1
     order_expiration: 3600
     gamma: 0.2
     k: 150.0
@@ -28,4 +29,13 @@ dynamic:
     position_limit_buffer: 0.05
     inventory_skew_factor: 0.001
     trade_side: "yes"
+    fee_rate: 0.07
+    fee_safety_buffer: 0.01
+    # Phase 1: adaptive per-market parameters
+    sigma_window_ticks: 30      # rolling window (5s ticks → ~2.5min of mid history)
+    sigma_min: 0.005            # floor to avoid σ=0 in quiet markets
+    sigma_scale: 1.0
+    k_min: 10.0                 # low depth → thinner book, wider spreads
+    k_max: 500.0                # deep book → tighter spreads
+    k_depth_reference: 200.0    # contracts of avg-side depth = k_max is reached
   dt: 5.0
