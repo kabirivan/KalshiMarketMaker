@@ -64,12 +64,14 @@ def run_market_worker(
         api.logout()
         return
 
+    event_ticker = ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
     market_maker = create_market_maker(
         dynamic_config.get("market_maker", {}),
         api,
         logger,
         dynamic_config.get("risk", {}),
         shared_risk_state,
+        event_ticker=event_ticker,
     )
     dt = dynamic_config.get("dt", 2.0)
 

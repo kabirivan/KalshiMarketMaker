@@ -3,6 +3,9 @@ dynamic:
   risk:
     max_global_contracts: 3            # CANARY: reducido de 20 → 3 para validación live 07-08
     max_contracts_per_market: 1
+    # Fix #3: cap de exposicion por evento (todos los strikes del mismo underlying comparten
+    # riesgo). Con max_global=3 y 4 strikes de un evento, este cap efectivamente concentra.
+    max_contracts_per_event: 2
     reserve_contracts_buffer: 1
   market_selector:
     top_n: 4                         # 4 workers → dentro de rate-limit safe
@@ -61,4 +64,8 @@ dynamic:
     k_min: 10.0
     k_max: 500.0
     k_depth_reference: 200.0
+    # Fix #2: proactive halt cuando el mercado esta a <N segundos del close.
+    # Complementa el min_time_to_close_seconds del selector (que es filtro por ciclo de 5min).
+    # 900s = 15min: cancela ordenes y sale del quote loop; el drain existente maneja inventory.
+    halt_before_close_seconds: 900
   dt: 5.0

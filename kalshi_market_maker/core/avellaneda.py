@@ -56,6 +56,9 @@ class AvellanedaMarketMaker:
         k_min: float = 10.0,
         k_max: float = 500.0,
         k_depth_reference: float = 200.0,
+        event_ticker: Optional[str] = None,
+        max_contracts_per_event: Optional[int] = None,
+        halt_before_close_seconds: float = 0.0,
     ):
         self.api = api
         self.logger = logger
@@ -91,6 +94,13 @@ class AvellanedaMarketMaker:
         self.mid_history = deque(maxlen=self.sigma_window_ticks)
         # None means "use elapsed_time / self.T"; otherwise this fraction is used directly.
         self._time_remaining_override: Optional[float] = None
+        self.event_ticker = event_ticker
+        self.max_contracts_per_event = max_contracts_per_event
+        self.halt_before_close_seconds = max(0.0, float(halt_before_close_seconds))
+        # Cached at first tick when we first observe close_time; the model horizon is then
+        # min(T_config, seconds_to_close_at_start) so the time-decay factor is meaningful
+        # even for markets closer than T_config seconds away.
+        self._effective_horizon_seconds: Optional[float] = None
 
     def run(self, dt: float, stop_event=None):
         start_time = time.time()
@@ -109,9 +119,27 @@ class AvellanedaMarketMaker:
                 self.mid_history.append(mid_price)
                 self.sigma = self._estimate_sigma()
                 self.k = self._estimate_k(mid_prices)
-                self._time_remaining_override = self._compute_time_remaining_fraction(
-                    mid_prices.get("close_time")
-                )
+                close_time_str = mid_prices.get("close_time")
+                self._time_remaining_override = self._compute_time_remaining_fraction(close_time_str)
+
+                # Fix #2: proactive halt when the market is dangerously close to resolution.
+                # The selector's min_time_to_close_seconds is a per-cycle filter (5-min cadence);
+                # this per-tick guard prevents quoting into the last minutes where event risk
+                # dominates and adverse selection is uncontrollable.
+                if self.halt_before_close_seconds > 0:
+                    seconds_to_close = self._compute_seconds_to_close(close_time_str)
+                    if seconds_to_close is not None and seconds_to_close < self.halt_before_close_seconds:
+                        self.logger.warning(
+                            f"HALT_NEAR_CLOSE: seconds_to_close={seconds_to_close:.0f}s "
+                            f"< halt_before_close_seconds={self.halt_before_close_seconds:.0f}s. "
+                            f"Cancelling resting orders and exiting quote loop; drain will handle inventory."
+                        )
+                        for order in self.api.get_orders():
+                            try:
+                                self.api.cancel_order(order["order_id"])
+                            except Exception as cancel_error:
+                                self.logger.error(f"HALT_NEAR_CLOSE cancel failed: {cancel_error}")
+                        break
 
                 reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
                 bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
@@ -123,10 +151,21 @@ class AvellanedaMarketMaker:
                     if self._time_remaining_override is not None
                     else ""
                 )
+                seconds_to_close_now = self._compute_seconds_to_close(close_time_str)
+                ttc_str = (
+                    f" ttc={seconds_to_close_now:.0f}s"
+                    if seconds_to_close_now is not None
+                    else ""
+                )
+                horizon_str = (
+                    f" T_eff={self._effective_horizon_seconds:.0f}s"
+                    if self._effective_horizon_seconds is not None
+                    else ""
+                )
                 self.logger.info(
                     f"t={current_time:.2f}s mid={mid_price:.4f} inventory={inventory} "
                     f"reservation={reservation_price:.4f} bid={bid_price:.4f} ask={ask_price:.4f} "
-                    f"σ={self.sigma:.4f} k={self.k:.1f}{t_rem_str}"
+                    f"σ={self.sigma:.4f} k={self.k:.1f}{t_rem_str}{ttc_str}{horizon_str}"
                 )
 
                 self.manage_orders(bid_price, ask_price, buy_size, sell_size, current_orders)
@@ -166,19 +205,28 @@ class AvellanedaMarketMaker:
         ratio = min(1.0, depth_avg / self.k_depth_reference)
         return self.k_min + (self.k_max - self.k_min) * ratio
 
-    def _compute_time_remaining_fraction(self, close_time_str) -> Optional[float]:
-        # Fraction of the model horizon T that is still available before market close.
-        # Returns None if we have no close_time to work with (caller then uses elapsed/T).
+    def _compute_seconds_to_close(self, close_time_str) -> Optional[float]:
         if not close_time_str:
             return None
         try:
             close_dt = datetime.fromisoformat(str(close_time_str).replace("Z", "+00:00"))
         except (ValueError, TypeError):
             return None
-        seconds_to_close = close_dt.timestamp() - time.time()
+        return close_dt.timestamp() - time.time()
+
+    def _compute_time_remaining_fraction(self, close_time_str) -> Optional[float]:
+        # Fraction of the effective model horizon still available before market close.
+        # Effective horizon = min(T_config, seconds_to_close_at_worker_start), cached lazily.
+        # For a market closing in 20 min with T_config=8h, the fraction decays from 1.0
+        # (worker start) to 0.0 (market close) rather than crawling 0.041 → 0.0.
+        seconds_to_close = self._compute_seconds_to_close(close_time_str)
+        if seconds_to_close is None:
+            return None
         if seconds_to_close <= 0:
             return 0.0
-        return max(0.0, min(1.0, seconds_to_close / self.T))
+        if self._effective_horizon_seconds is None:
+            self._effective_horizon_seconds = min(float(self.T), max(1.0, seconds_to_close))
+        return max(0.0, min(1.0, seconds_to_close / self._effective_horizon_seconds))
 
     def calculate_asymmetric_quotes(self, mid_price: float, inventory: int, elapsed_time: float) -> Tuple[float, float]:
         reservation_price = self.calculate_reservation_price(mid_price, inventory, elapsed_time)
@@ -256,15 +304,53 @@ class AvellanedaMarketMaker:
         equal_weight_cap = max(1, global_budget // active_markets)
         return max(1, min(configured_market_cap, equal_weight_cap))
 
+    @staticmethod
+    def _extract_event_ticker(market_ticker: str) -> str:
+        # Kalshi market tickers are "<EVENT>-<STRIKE>"; the event ticker is the
+        # market ticker with the last hyphen-delimited segment removed. For
+        # KXNATGASD-26JUL1317-T2.895 the event is KXNATGASD-26JUL1317.
+        if not market_ticker or "-" not in market_ticker:
+            return market_ticker or ""
+        return market_ticker.rsplit("-", 1)[0]
+
     def get_global_remaining_capacity(self) -> int:
-        if self.max_global_contracts is None:
+        if self.max_global_contracts is None and self.max_contracts_per_event is None:
             return 10**9
 
         try:
             positions = self.api.list_all_positions()
-            total_abs_position = sum(abs(int(float(position.get("position", 0)))) for position in positions)
-            remaining = int(self.max_global_contracts) - self.reserve_contracts_buffer - total_abs_position
-            return max(0, remaining)
+
+            def raw_signed(position_row: Dict) -> int:
+                raw = position_row.get("position_fp", position_row.get("position", 0)) or 0
+                try:
+                    return int(float(raw))
+                except (TypeError, ValueError):
+                    return 0
+
+            total_abs_position = sum(abs(raw_signed(position_row)) for position_row in positions)
+
+            remainings = []
+            if self.max_global_contracts is not None:
+                global_remaining = (
+                    int(self.max_global_contracts)
+                    - self.reserve_contracts_buffer
+                    - total_abs_position
+                )
+                remainings.append(max(0, global_remaining))
+
+            # Fix #3: cap total exposure per event to prevent correlated risk from
+            # accumulating across strikes of the same underlying (e.g. multiple
+            # KXNATGASD-<date> strikes all reprice on the same natgas move).
+            if self.max_contracts_per_event is not None and self.event_ticker:
+                per_event_abs = 0
+                for position_row in positions:
+                    ticker = position_row.get("ticker", "") or ""
+                    if self._extract_event_ticker(ticker) == self.event_ticker:
+                        per_event_abs += abs(raw_signed(position_row))
+                event_remaining = int(self.max_contracts_per_event) - per_event_abs
+                remainings.append(max(0, event_remaining))
+
+            return min(remainings) if remainings else 10**9
         except Exception as global_exception:
             self.logger.error(f"Global risk snapshot failed, blocking new risk: {global_exception}")
             return 0

@@ -20,7 +20,14 @@ def create_api(api_config: Dict, logger, market_ticker: str | None = None) -> Ka
     )
 
 
-def create_market_maker(mm_config: Dict, api, logger, risk_config: Dict | None = None, shared_risk_state: Dict | None = None) -> AvellanedaMarketMaker:
+def create_market_maker(
+    mm_config: Dict,
+    api,
+    logger,
+    risk_config: Dict | None = None,
+    shared_risk_state: Dict | None = None,
+    event_ticker: str | None = None,
+) -> AvellanedaMarketMaker:
     risk_config = risk_config or {}
 
     return AvellanedaMarketMaker(
@@ -51,4 +58,7 @@ def create_market_maker(mm_config: Dict, api, logger, risk_config: Dict | None =
         k_min=mm_config.get("k_min", 10.0),
         k_max=mm_config.get("k_max", 500.0),
         k_depth_reference=mm_config.get("k_depth_reference", 200.0),
+        event_ticker=event_ticker,
+        max_contracts_per_event=risk_config.get("max_contracts_per_event"),
+        halt_before_close_seconds=mm_config.get("halt_before_close_seconds", 0.0),
     )
