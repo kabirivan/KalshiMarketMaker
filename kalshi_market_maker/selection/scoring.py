@@ -113,28 +113,50 @@ def select_top_markets(markets: List[Dict], selector_cfg: Dict) -> List[Tuple[st
             )
         return collected
 
-    candidates = collect_candidates(ignore_thresholds=False)
-    if not candidates:
-        candidates = collect_candidates(ignore_thresholds=True)
-    if not candidates:
-        return []
-
-    volumes = [market["volume_24h"] for market in candidates]
-    spreads = [market["spread_cents"] for market in candidates]
-    min_volume, max_volume = min(volumes), max(volumes)
-    min_spread, max_spread = min(spreads), max(spreads)
+    backfill_below_top_n = bool(selector_cfg.get("backfill_below_top_n", False))
 
     def normalize(value: float, low: float, high: float) -> float:
         if high == low:
             return 1.0
         return (value - low) / (high - low)
 
-    ranked = []
-    for market in candidates:
-        volume_norm = normalize(market["volume_24h"], min_volume, max_volume)
-        spread_norm = 1.0 - normalize(market["spread_cents"], min_spread, max_spread)
-        score = volume_weight * volume_norm + spread_weight * spread_norm
-        ranked.append((market["ticker"], score, market["volume_24h"], market["spread_cents"]))
+    def rank_pool(pool: List[Dict]) -> List[Tuple[str, float, float, float]]:
+        if not pool:
+            return []
+        volumes = [market["volume_24h"] for market in pool]
+        spreads = [market["spread_cents"] for market in pool]
+        min_volume, max_volume = min(volumes), max(volumes)
+        min_spread, max_spread = min(spreads), max(spreads)
+        ranked_local = []
+        for market in pool:
+            volume_norm = normalize(market["volume_24h"], min_volume, max_volume)
+            spread_norm = 1.0 - normalize(market["spread_cents"], min_spread, max_spread)
+            score = volume_weight * volume_norm + spread_weight * spread_norm
+            ranked_local.append((market["ticker"], score, market["volume_24h"], market["spread_cents"]))
+        ranked_local.sort(key=lambda row: row[1], reverse=True)
+        return ranked_local
 
-    ranked.sort(key=lambda row: row[1], reverse=True)
-    return ranked[:top_n]
+    strict_pool = collect_candidates(ignore_thresholds=False)
+    ranked_strict = rank_pool(strict_pool)
+
+    if len(ranked_strict) >= top_n:
+        return ranked_strict[:top_n]
+
+    if not ranked_strict:
+        # No strict candidates: fall back to relaxed pool entirely (backward compat).
+        return rank_pool(collect_candidates(ignore_thresholds=True))[:top_n]
+
+    if not backfill_below_top_n:
+        # Backfill disabled: return whatever the strict pool gave us, even if < top_n.
+        return ranked_strict
+
+    # Backfill: strict pool has 1..top_n-1 candidates. Rank the relaxed pool separately
+    # (so strict markets always outrank relaxed ones) and append until we hit top_n.
+    strict_tickers = {row[0] for row in ranked_strict}
+    relaxed_only = [
+        market for market in collect_candidates(ignore_thresholds=True)
+        if market["ticker"] not in strict_tickers
+    ]
+    ranked_relaxed = rank_pool(relaxed_only)
+    slots_needed = top_n - len(ranked_strict)
+    return ranked_strict + ranked_relaxed[:slots_needed]

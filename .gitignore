@@ -47,3 +47,6 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Large market data snapshots (research artifacts, not source)
+market_snapshots*.csv

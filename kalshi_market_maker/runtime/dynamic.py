@@ -1,6 +1,7 @@
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import threading
 
 import requests
@@ -12,16 +13,29 @@ from .cleanup import stop_worker_then_cancel
 from .workers import run_market_worker
 
 
+def _series_prefix(ticker: str) -> str:
+    """Extract series prefix from a Kalshi ticker (e.g. KXPGAMAKECUT-GESO26-ECOL -> KXPGAMAKECUT)."""
+    m = re.match(r"^(KX[A-Z0-9]+?)(?:-|\d{2}[A-Z]{3})", ticker or "")
+    return m.group(1) if m else (ticker or "").split("-")[0]
+
+
 def run_dynamic_strategy(dynamic_config: Dict):
     logger = build_logger("DynamicSelector", dynamic_config.get("log_level", "INFO"))
 
     selector_cfg = dynamic_config.get("market_selector", {})
     refresh_seconds = safe_float(selector_cfg.get("refresh_seconds", 20), 20.0)
     series_ticker = selector_cfg.get("series_ticker")
+    series_allowlist_raw = selector_cfg.get("series_allowlist") or []
+    series_allowlist: Optional[Set[str]] = (
+        set(str(s).upper() for s in series_allowlist_raw) if series_allowlist_raw else None
+    )
     mve_filter = selector_cfg.get("mve_filter", "exclude")
     page_limit = int(selector_cfg.get("page_limit", 250))
     max_pages = int(selector_cfg.get("max_pages", 5))
     max_markets = int(selector_cfg.get("max_markets", 1250))
+
+    if series_allowlist:
+        logger.info(f"Series allowlist active: {sorted(series_allowlist)}")
 
     selector_api = create_api(dynamic_config.get("api", {}), logger, market_ticker="DYNAMIC")
     active_workers: Dict[str, Tuple[threading.Event, object]] = {}
@@ -45,6 +59,11 @@ def run_dynamic_strategy(dynamic_config: Dict):
                         max_pages=max_pages,
                         max_markets=max_markets,
                     )
+                    if series_allowlist:
+                        markets = [
+                            m for m in markets
+                            if _series_prefix(m.get("ticker", "")).upper() in series_allowlist
+                        ]
                     ranked = select_top_markets(markets, selector_cfg)
                     selected_tickers = [ticker for ticker, _, _, _ in ranked]
                     last_selected_tickers = selected_tickers

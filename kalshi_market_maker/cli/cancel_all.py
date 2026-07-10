@@ -175,23 +175,30 @@ def main():
                 market = api.get_market(ticker)
                 market_data = market.get("market", {})
 
+                def _cents(dollars_key: str, cents_key: str):
+                    dollars = market_data.get(dollars_key)
+                    if dollars is not None:
+                        return int(round(float(dollars) * 100))
+                    cents = market_data.get(cents_key)
+                    return int(cents) if cents is not None else None
+
                 if signed_position > 0:
                     action = "sell"
                     side = "yes"
-                    best_bid = market_data.get("yes_bid")
+                    best_bid = _cents("yes_bid_dollars", "yes_bid")
                     if best_bid is None:
                         logger.error(f"Skipping liquidation for {ticker}: missing yes_bid")
                         continue
-                    price_cents = max(1, int(best_bid) - price_offset_cents)
+                    price_cents = max(1, best_bid - price_offset_cents)
                     quantity = signed_position
                 else:
                     action = "buy"
                     side = "yes"
-                    best_ask = market_data.get("yes_ask")
+                    best_ask = _cents("yes_ask_dollars", "yes_ask")
                     if best_ask is None:
                         logger.error(f"Skipping liquidation for {ticker}: missing yes_ask")
                         continue
-                    price_cents = min(99, int(best_ask) + price_offset_cents)
+                    price_cents = min(99, best_ask + price_offset_cents)
                     quantity = abs(signed_position)
 
                 liquidation_candidates.append(

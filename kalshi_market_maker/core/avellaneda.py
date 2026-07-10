@@ -47,9 +47,12 @@ class AvellanedaMarketMaker:
         shared_risk_state: Optional[Dict] = None,
         fee_rate: float = 0.07,
         fee_safety_buffer: float = 0.01,
+        adverse_selection_buffer: float = 0.0,
         sigma_window_ticks: int = 30,
         sigma_min: float = 0.005,
         sigma_scale: float = 1.0,
+        sigma_spike_threshold: float = 0.0,
+        sigma_spike_widening_factor: float = 0.0,
         k_min: float = 10.0,
         k_max: float = 500.0,
         k_depth_reference: float = 200.0,
@@ -75,10 +78,13 @@ class AvellanedaMarketMaker:
         self.shared_risk_state = shared_risk_state or {"active_markets": 1}
         self.fee_rate = fee_rate
         self.fee_safety_buffer = fee_safety_buffer
+        self.adverse_selection_buffer = max(0.0, float(adverse_selection_buffer))
         # Phase 1: per-market adaptive params.
         self.sigma_window_ticks = max(5, int(sigma_window_ticks))
         self.sigma_min = sigma_min
         self.sigma_scale = sigma_scale
+        self.sigma_spike_threshold = max(0.0, float(sigma_spike_threshold))
+        self.sigma_spike_widening_factor = max(0.0, float(sigma_spike_widening_factor))
         self.k_min = k_min
         self.k_max = k_max
         self.k_depth_reference = max(1.0, float(k_depth_reference))
@@ -216,10 +222,19 @@ class AvellanedaMarketMaker:
         position_ratio = min(1.0, abs(inventory) / effective_max_position)
         spread_multiplier = 1 + 2.0 * position_ratio
         # Fee-aware floor: Kalshi charges ~ceil(fee_rate * price * (1 - price)) cents per side per contract.
-        # Roundtrip fee = 2 sides; add a safety buffer for slippage / adverse selection.
+        # Roundtrip fee = 2 sides; add a fee safety buffer and an adverse-selection cushion
+        # to price in the information asymmetry cost of being top-of-book.
         fee_per_side = math.ceil(self.fee_rate * mid_price * (1 - mid_price) * 100) / 100
-        fee_min_spread = 2 * fee_per_side + self.fee_safety_buffer
+        fee_min_spread = 2 * fee_per_side + self.fee_safety_buffer + self.adverse_selection_buffer
         effective_min = max(self.min_spread, fee_min_spread)
+        # Vol-spike widening: when *realized* sigma jumps above threshold, widen effective_min
+        # proportionally so we stay safe during regime shifts even if fee_min dominates otherwise.
+        # Skipped during warm-up because sigma_config seeded here may be a wide default.
+        min_samples = max(5, self.sigma_window_ticks // 3)
+        past_warmup = len(self.mid_history) >= min_samples
+        if past_warmup and self.sigma_spike_threshold > 0 and self.sigma > self.sigma_spike_threshold:
+            spike_ratio = (self.sigma - self.sigma_spike_threshold) / self.sigma_spike_threshold
+            effective_min *= 1.0 + self.sigma_spike_widening_factor * spike_ratio
         return max(base_spread * spread_multiplier, effective_min)
 
     def calculate_dynamic_gamma(self, inventory: int) -> float:

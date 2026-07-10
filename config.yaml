@@ -1,41 +1,64 @@
 dynamic:
   log_level: INFO
   risk:
-    max_global_contracts: 70
+    max_global_contracts: 3            # CANARY: reducido de 20 → 3 para validación live 07-08
     max_contracts_per_market: 1
     reserve_contracts_buffer: 1
   market_selector:
-    top_n: 2
-    refresh_seconds: 45
+    top_n: 4                         # 4 workers → dentro de rate-limit safe
+    refresh_seconds: 300
     worker_shutdown_timeout_seconds: 15
-    min_volume_24h: 500
-    min_spread_cents: 2
+    # Drain-with-inventory: cuando un ticker rota fuera del selector con posicion abierta,
+    # el bot cancela ordenes + submit taker aggressive para flatten (evita orphans).
+    drain_liquidate_position: true
+    drain_liquidation_rounds: 3
+    drain_liquidation_round_sleep_seconds: 1.5
+    drain_liquidation_price_offset_cents: 1
+    drain_liquidation_expiration_seconds: 30
+    min_volume_24h: 100              # bajo para dar chance a series de bajo flow
+    min_spread_cents: 3              # 3c minimo (fees round-trip son ~2c)
+    # Si el pool estricto tiene < top_n candidatos, completa top_n con mercados
+    # del pool relajado (sin thresholds) — evita quedar a 25% de capacidad en
+    # ventanas volatiles donde solo 1-2 strikes pasan filtros duros
+    backfill_below_top_n: true
     volume_weight: 0.35
     spread_weight: 0.65
     mve_filter: exclude
-    page_limit: 250
-    max_pages: 5
-    max_markets: 1250
-    min_time_to_close_seconds: 300
-    # series_ticker: "FED"
+    page_limit: 1000
+    max_pages: 10
+    max_markets: 10000
+    min_time_to_close_seconds: 14400 # 4h buffer para live sports (WC games)
+    # Allowlist reducida: solo Tier S golf + Tier B macro (sin live sports)
+    # Removidos: ATP*, WC* → live sports mostraron toxicity real en prod (07-07)
+    series_allowlist:
+      - KXPGAMAKECUT           # Tier S: golf make-cut (STD 0.32c, TOX 0.1%)
+      - KXPGATOP20              # Tier S: golf top-20 (STD 0.39c, TOX 0.0%)
+      - KXNATGASD               # Tier B: nat gas daily (macro, mean-reverting)
+      - KXNASDAQ100U            # Tier B: NASDAQ hourly (macro)
   market_maker:
     max_position: 1
     order_expiration: 3600
-    gamma: 0.2
+    gamma: 0.5                       # mas risk averse
     k: 150.0
     sigma: 0.10
     T: 28800
-    min_spread: 0.03
+    min_spread: 0.07                 # 7c: cubre fees + adverse cushion (subido de 5c tras canary 07-09)
     position_limit_buffer: 0.05
-    inventory_skew_factor: 0.001
+    inventory_skew_factor: 0.02      # cierra mas agresivo al tener inventory
     trade_side: "yes"
     fee_rate: 0.07
     fee_safety_buffer: 0.01
+    adverse_selection_buffer: 0.03   # 3c cushion vs adverse selection (canary mostro 4.6% edge eaten)
     # Phase 1: adaptive per-market parameters
-    sigma_window_ticks: 30      # rolling window (5s ticks → ~2.5min of mid history)
-    sigma_min: 0.005            # floor to avoid σ=0 in quiet markets
+    sigma_window_ticks: 30
+    sigma_min: 0.005
     sigma_scale: 1.0
-    k_min: 10.0                 # low depth → thinner book, wider spreads
-    k_max: 500.0                # deep book → tighter spreads
-    k_depth_reference: 200.0    # contracts of avg-side depth = k_max is reached
+    # Vol-spike protection: si σ realizado > threshold, ensancha el floor de spread
+    # sigma_spike_threshold: 0.02 → 4x el sigma quiet-time observado en canary
+    # widening_factor: 1.0 → spread se dobla cuando σ dobla el threshold
+    sigma_spike_threshold: 0.02
+    sigma_spike_widening_factor: 1.0
+    k_min: 10.0
+    k_max: 500.0
+    k_depth_reference: 200.0
   dt: 5.0
