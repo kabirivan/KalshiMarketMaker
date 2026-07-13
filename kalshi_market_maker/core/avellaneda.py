@@ -168,6 +168,12 @@ class AvellanedaMarketMaker:
                     f"σ={self.sigma:.4f} k={self.k:.1f}{t_rem_str}{ttc_str}{horizon_str}"
                 )
 
+                # Check stop signal right before mutating orders so a shutdown mid-tick
+                # doesn't leak fresh place_order calls after the selector rotated us out.
+                if stop_event is not None and stop_event.is_set():
+                    self.logger.info("Stop signal received mid-tick, skipping order placement")
+                    break
+
                 self.manage_orders(bid_price, ask_price, buy_size, sell_size, current_orders)
             except requests.exceptions.HTTPError as http_error:
                 if _is_market_closed_error(http_error):
@@ -176,7 +182,15 @@ class AvellanedaMarketMaker:
                     )
                     break
                 raise
-            time.sleep(dt)
+            # Interruptible sleep: Event.wait returns True if the flag is set within dt,
+            # letting us exit within milliseconds of the selector's stop signal instead of
+            # burning the remainder of a 5s tick.
+            if stop_event is not None:
+                if stop_event.wait(dt):
+                    self.logger.info("Stop signal received during sleep, shutting down")
+                    break
+            else:
+                time.sleep(dt)
 
         self.logger.info("Avellaneda market maker finished running")
 
