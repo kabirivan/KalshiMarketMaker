@@ -286,8 +286,22 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def cancel_order(self, order_id: int) -> bool:
         # Kalshi V2 cancel path; reduced_by is a decimal string.
+        # Cancel is idempotent by intent: if the order is already gone
+        # (filled, expired, or previously cancelled), Kalshi returns 404
+        # not_found. Treat that as success — the desired state (order not
+        # resting) is already achieved. Raising here would crash the worker
+        # on a routine race between get_orders() and cancel_order().
         path = f"/portfolio/events/orders/{order_id}"
-        response = self.make_request("DELETE", path)
+        try:
+            response = self.make_request("DELETE", path)
+        except requests.exceptions.HTTPError as http_error:
+            response_obj = getattr(http_error, "response", None)
+            if response_obj is not None and response_obj.status_code == 404:
+                self.logger.warning(
+                    f"cancel_order: order {order_id} already gone (404); treating as success"
+                )
+                return False
+            raise
         try:
             reduced = float(response.get("reduced_by", "0"))
         except (TypeError, ValueError):
