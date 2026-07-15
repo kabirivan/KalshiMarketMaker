@@ -44,10 +44,34 @@ def run_dynamic_strategy(dynamic_config: Dict):
     shared_risk_state = {"active_markets": 1}
     selector_backoff_seconds = 5.0
     max_selector_backoff_seconds = 120.0
+    # Watchdog: warn loudly if the selector goes N cycles without a successful
+    # market listing. Root cause of the 07-14 zombie: a DNS/network hiccup mid-
+    # cycle left workers dead and no one respawned them.
+    last_successful_selector_ts = time.time()
+    stall_threshold_seconds = max(refresh_seconds * 3, 300.0)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         try:
             while True:
+                # Zombie-worker recovery: reap workers whose future finished with
+                # an exception (network death, unhandled crash) so the spawn loop
+                # below can re-create them this cycle. Without this, active_workers
+                # still contains the dead entry and the `not in active_workers`
+                # guard skips respawn forever.
+                for ticker in list(active_workers.keys()):
+                    _, future = active_workers[ticker]
+                    if future.done():
+                        try:
+                            worker_exception = future.exception(timeout=0)
+                        except Exception:
+                            worker_exception = None
+                        if worker_exception is not None:
+                            logger.error(
+                                f"Reaping dead worker {ticker} (exception={worker_exception!r}); "
+                                f"will respawn if still in top_n"
+                            )
+                            del active_workers[ticker]
+
                 markets: List[Dict] = []
                 selected_tickers = last_selected_tickers
 
@@ -68,6 +92,7 @@ def run_dynamic_strategy(dynamic_config: Dict):
                     selected_tickers = [ticker for ticker, _, _, _ in ranked]
                     last_selected_tickers = selected_tickers
                     selector_backoff_seconds = 5.0
+                    last_successful_selector_ts = time.time()
                 except requests.exceptions.HTTPError as http_error:
                     status_code = http_error.response.status_code if http_error.response is not None else None
                     if status_code == 429:
@@ -90,6 +115,14 @@ def run_dynamic_strategy(dynamic_config: Dict):
                 selected_set = set(selected_tickers)
                 shared_risk_state["active_markets"] = max(1, len(selected_tickers))
                 logger.info(f"Selector found {len(markets)} open markets; selected: {selected_tickers}")
+
+                seconds_since_success = time.time() - last_successful_selector_ts
+                if seconds_since_success > stall_threshold_seconds:
+                    logger.critical(
+                        f"SELECTOR_STALL: {seconds_since_success:.0f}s since last successful cycle "
+                        f"(threshold={stall_threshold_seconds:.0f}s). Active workers: {len(active_workers)}. "
+                        f"Consider manual investigation — likely network issue or auth failure."
+                    )
 
                 for ticker in list(active_workers.keys()):
                     stop_event, future = active_workers[ticker]
