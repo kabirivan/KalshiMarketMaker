@@ -31,13 +31,16 @@ dynamic:
     max_pages: 10
     max_markets: 10000
     min_time_to_close_seconds: 14400 # 4h buffer para live sports (WC games)
-    # Allowlist reducida: solo Tier S golf + Tier B macro (sin live sports)
+    # Allowlist reducida: solo Tier S golf + Tier B NatGas daily
     # Removidos: ATP*, WC* → live sports mostraron toxicity real en prod (07-07)
+    # Removido: KXNASDAQ100U → hourly strikes near-the-money son extremadamente
+    # sensibles al subyacente cerca del cierre US. Canary 07-15: -36c en 2 min
+    # con 3 fills adverse-selected en T29529.99 (mid osciló 0.65 → 0.43 → 0.64 → 0.47).
+    # El diseño de spread 7c + adverse buffer 3c es insuficiente para esa volatilidad.
     series_allowlist:
       - KXPGAMAKECUT           # Tier S: golf make-cut (STD 0.32c, TOX 0.1%)
       - KXPGATOP20              # Tier S: golf top-20 (STD 0.39c, TOX 0.0%)
       - KXNATGASD               # Tier B: nat gas daily (macro, mean-reverting)
-      - KXNASDAQ100U            # Tier B: NASDAQ hourly (macro)
   market_maker:
     max_position: 1
     order_expiration: 3600
